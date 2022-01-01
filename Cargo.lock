@@ -358,6 +358,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hmac",
+ "lazy_static",
  "regex",
  "serde",
  "serde_derive",
