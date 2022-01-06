@@ -1,19 +1,10 @@
-use base64;
 use hmac::{Hmac, Mac};
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde_derive::{Deserialize, Serialize};
-use serde_json;
 use sha2::Sha256;
-use std::{env, net::Ipv4Addr};
-use warp::{
-    http::Response,
-    hyper::{body::Bytes, StatusCode},
-    Filter,
-};
-
-const MALFORMED_REQUEST: &str = "{\"type\":\"message\",\"text\":\"Error: Malformed request\"}";
-const UNAUTHORIZED_CLIENT: &str = "{\"type\":\"message\",\"text\":\"Error: Unauthorized client\"}";
+use std::{cmp::Ordering, env, net::Ipv4Addr};
+use warp::{hyper::body::Bytes, Filter, Rejection};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,28 +14,37 @@ struct TeamsMessage {
     text: String,
 }
 
+#[derive(Debug)]
+struct FailAuth;
+
+impl warp::reject::Reject for FailAuth {}
+
+#[derive(Debug)]
+struct MalformedRequest;
+
+impl warp::reject::Reject for MalformedRequest {}
+
+fn extract_teams_message() -> impl Filter<Extract = (TeamsMessage,), Error = Rejection> + Clone {
+    warp::header("Authorization")
+        .and(warp::body::bytes())
+        .and_then(|auth: String, bytes: Bytes| async move {
+            if !is_authorized(auth, &bytes) {
+                return Err(warp::reject::custom(FailAuth));
+            }
+            let request_message: TeamsMessage = match serde_json::from_slice(&bytes) {
+                Ok(msg) => msg,
+                Err(_) => return Err(warp::reject::custom(MalformedRequest)),
+            };
+            Ok::<TeamsMessage, Rejection>(request_message)
+        })
+}
+
 #[tokio::main]
 async fn main() {
     let teams_filter = warp::post()
         .and(warp::path!("api" / "TeamsTrigger"))
-        .and(warp::header("Authorization"))
-        .and(warp::body::bytes())
-        .map(|auth: String, bytes: Bytes| {
-            if is_authorized(auth, &bytes) {
-                match handle_message(&bytes) {
-                    Ok(body) => return Response::builder().body(body),
-                    Err(err_body) => {
-                        return Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(err_body)
-                    }
-                }
-            } else {
-                Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(String::from(UNAUTHORIZED_CLIENT))
-            }
-        });
+        .and(extract_teams_message())
+        .map(handle_teams_message);
 
     let port_key = "FUNCTIONS_CUSTOMHANDLER_PORT";
     let port: u16 = match env::var(port_key) {
@@ -57,45 +57,35 @@ async fn main() {
         .await
 }
 
-fn handle_message(bytes: &Bytes) -> Result<String, String> {
-    let request_message: TeamsMessage = match serde_json::from_slice(&bytes) {
-        Ok(msg) => msg,
-        Err(_) => return Err(String::from(MALFORMED_REQUEST)),
-    };
-
+fn handle_teams_message(request_message: TeamsMessage) -> String {
     let response_message: TeamsMessage = TeamsMessage {
         r#type: "message".to_string(),
         text: get_jira_link(request_message.text.as_str()),
     };
 
-    Ok(
-        serde_json::to_string(&response_message)
-            .expect("Failed to serialize the response message."),
-    )
+    serde_json::to_string(&response_message).expect("Failed to serialize the response message.")
 }
 
 fn get_jira_link(text: &str) -> String {
     lazy_static! {
-        static ref JIRA_HOST: String = env::var("jira_host").unwrap_or("jira".to_string());
+        static ref JIRA_HOST: String = env::var("jira_host").unwrap_or_else(|_| "jira".to_string());
         static ref RE: Regex = Regex::new(r#"[A-Z0-9]+-[0-9]+"#).unwrap();
     }
     let tickets: Vec<&str> = RE.find_iter(text).map(|mat| mat.as_str()).collect();
 
-    if tickets.len() == 1 {
-        format!(
-            "<a href=\"http://{0}/browse/{1}\">{1}</a>",
+    match tickets.len().cmp(&1) {
+        Ordering::Equal => format!(
+            r#"<a href="http://{0}/browse/{1}">{1}</a>"#,
             JIRA_HOST.as_str(),
             tickets[0]
-        )
-    } else if tickets.len() > 1 {
-        format!(
-            "<a href=\"http://{}/issues/?jql=key%20in%20({})\">Found {} tickets</a>",
+        ),
+        Ordering::Greater => format!(
+            r#"<a href="http://{}/issues/?jql=key%20in%20({})">Found {} tickets</a>"#,
             JIRA_HOST.as_str(),
             tickets.join(","),
             tickets.len()
-        )
-    } else {
-        "No tickets found".to_string()
+        ),
+        Ordering::Less => "No tickets found".to_string(),
     }
 }
 
@@ -118,7 +108,7 @@ fn is_authorized(auth: String, bytes: &Bytes) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{get_jira_link, handle_message, is_authorized, MALFORMED_REQUEST};
+    use crate::{get_jira_link, is_authorized};
     use std::env;
     use warp::hyper::body::Bytes;
 
@@ -130,28 +120,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_message_good() {
-        let bytes = Bytes::from_static(b"{\"type\":\"message\",\"text\":\"Nothing\"}");
-        let result = handle_message(&bytes).unwrap();
-        assert_eq!(
-            String::from("{\"type\":\"message\",\"text\":\"No tickets found\"}"),
-            result
-        );
-    }
-
-    #[test]
-    fn handle_message_malformed() {
-        let bytes = Bytes::from_static(b"{\"not\":\"valid\",\"teams\":\"message\"}");
-        match handle_message(&bytes) {
-            Ok(_) => assert!(false, "Serialization should fail here."),
-            Err(e) => assert!(e == MALFORMED_REQUEST),
-        };
-    }
-
-    #[test]
     fn get_jira_link_many() {
         let result = get_jira_link("Ticket one is BACKLOG-1234 and two is MED-789");
-        assert_eq!(result, "<a href=\"http://jira/issues/?jql=key%20in%20(BACKLOG-1234,MED-789)\">Found 2 tickets</a>");
+        assert_eq!(
+            result,
+            r#"<a href="http://jira/issues/?jql=key%20in%20(BACKLOG-1234,MED-789)">Found 2 tickets</a>"#
+        );
     }
 
     #[test]
@@ -159,7 +133,7 @@ mod tests {
         let result = get_jira_link("The one is BACKLOG-1234");
         assert_eq!(
             result,
-            "<a href=\"http://jira/browse/BACKLOG-1234\">BACKLOG-1234</a>"
+            r#"<a href="http://jira/browse/BACKLOG-1234">BACKLOG-1234</a>"#
         );
     }
 
@@ -176,8 +150,7 @@ mod tests {
         let bytes = Bytes::from_static(
             b"{\"type\":\"message\",\"text\":\"Ticket one is BACKLOG-1234 and two is MED-789\"}",
         );
-        let result = is_authorized(auth, &bytes);
-        assert_eq!(false, result);
+        assert!(!is_authorized(auth, &bytes));
     }
 
     #[test]
@@ -187,7 +160,6 @@ mod tests {
         let bytes = Bytes::from_static(
             b"{\"type\":\"message\",\"text\":\"Ticket one is BACKLOG-1234 and two is MED-789\"}",
         );
-        let result = is_authorized(auth, &bytes);
-        assert_eq!(true, result);
+        assert!(is_authorized(auth, &bytes));
     }
 }
