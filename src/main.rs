@@ -8,6 +8,15 @@ use warp::{hyper::body::Bytes, Filter, Rejection};
 
 type HmacSha256 = Hmac<Sha256>;
 
+lazy_static! {
+    static ref SECURITY_TOKEN: String =
+        env::var("security_token").expect("The security_token env var is required");
+    static ref SECURITY_TOKEN_BYTES: Vec<u8> =
+        base64::decode(SECURITY_TOKEN.as_str()).expect("Security token should always decode");
+    static ref JIRA_HOST: String = env::var("jira_host").unwrap_or_else(|_| "jira".to_string());
+    static ref RE: Regex = Regex::new(r#"[A-Z0-9]+-[0-9]+"#).unwrap();
+}
+
 #[derive(Deserialize, Serialize)]
 struct TeamsMessage {
     r#type: String,
@@ -31,30 +40,10 @@ fn extract_teams_message() -> impl Filter<Extract = (TeamsMessage,), Error = Rej
             if !is_authorized(auth, &bytes) {
                 return Err(warp::reject::custom(FailAuth));
             }
-            let request_message: TeamsMessage = match serde_json::from_slice(&bytes) {
-                Ok(msg) => msg,
-                Err(_) => return Err(warp::reject::custom(MalformedRequest)),
-            };
+            let request_message: TeamsMessage = serde_json::from_slice(&bytes)
+                .map_err(|_| warp::reject::custom(MalformedRequest))?;
             Ok::<TeamsMessage, Rejection>(request_message)
         })
-}
-
-#[tokio::main]
-async fn main() {
-    let teams_filter = warp::post()
-        .and(warp::path!("api" / "TeamsTrigger"))
-        .and(extract_teams_message())
-        .map(handle_teams_message);
-
-    let port_key = "FUNCTIONS_CUSTOMHANDLER_PORT";
-    let port: u16 = match env::var(port_key) {
-        Ok(val) => val.parse().expect("Custom Handler port is not a number!"),
-        Err(_) => 3000,
-    };
-
-    warp::serve(teams_filter)
-        .run((Ipv4Addr::UNSPECIFIED, port))
-        .await
 }
 
 fn handle_teams_message(request_message: TeamsMessage) -> String {
@@ -67,10 +56,6 @@ fn handle_teams_message(request_message: TeamsMessage) -> String {
 }
 
 fn get_jira_link(text: &str) -> String {
-    lazy_static! {
-        static ref JIRA_HOST: String = env::var("jira_host").unwrap_or_else(|_| "jira".to_string());
-        static ref RE: Regex = Regex::new(r#"[A-Z0-9]+-[0-9]+"#).unwrap();
-    }
     let tickets: Vec<&str> = RE.find_iter(text).map(|mat| mat.as_str()).collect();
 
     match tickets.len().cmp(&1) {
@@ -90,20 +75,29 @@ fn get_jira_link(text: &str) -> String {
 }
 
 fn is_authorized(auth: String, bytes: &Bytes) -> bool {
-    lazy_static! {
-        static ref SECURITY_TOKEN: String =
-            env::var("security_token").expect("The security_token env var is required");
-    }
-    let security_token_bytes =
-        base64::decode(SECURITY_TOKEN.as_str()).expect("Security token should always decode");
-
     let mut mac =
-        HmacSha256::new_from_slice(&security_token_bytes).expect("HMAC can take key of any size");
+        HmacSha256::new_from_slice(&SECURITY_TOKEN_BYTES).expect("HMAC can take key of any size");
     mac.update(bytes);
-    let result = mac.finalize();
-    let signature = base64::encode(result.into_bytes());
-    let auth_token = auth.split(' ').nth(1).unwrap_or("BAD AUTH");
-    signature.as_str() == auth_token
+    let signature = base64::encode(mac.finalize().into_bytes());
+    signature.as_str() == auth.split(' ').nth(1).unwrap_or_default()
+}
+
+#[tokio::main]
+async fn main() {
+    let teams_filter = warp::post()
+        .and(warp::path!("api" / "TeamsTrigger"))
+        .and(extract_teams_message())
+        .map(handle_teams_message);
+
+    let port_key = "FUNCTIONS_CUSTOMHANDLER_PORT";
+    let port: u16 = match env::var(port_key) {
+        Ok(val) => val.parse().expect("Custom Handler port is not a number!"),
+        Err(_) => 3000,
+    };
+
+    warp::serve(teams_filter)
+        .run((Ipv4Addr::UNSPECIFIED, port))
+        .await
 }
 
 #[cfg(test)]
